@@ -1,0 +1,19 @@
+cheziunix, reut.barak2
+Chezi Imany (311520647), Reut Barak (307830463)
+EX: 3
+
+FILES:
+README
+MapReduceFramework.cpp - implemantation of the MapReduceFramework.h headers file.
+makefile - generates the libmapreduce.a library.
+
+
+REMARKS:
+This is an implementation of the third exercise of the course OS.
+The execersice include one assingment: creatibg a ,ap reduce libraryto implement the map reduce algorithm to
+handle race conditions.
+
+
+
+
+
