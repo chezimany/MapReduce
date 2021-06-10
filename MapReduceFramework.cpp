@@ -37,6 +37,7 @@ typedef struct JobContext
     std::atomic<long unsigned int>* totalMappedPairs{};
     std::atomic<bool>* isWaitedFor{};
     pthread_mutex_t* waitForMutex{};
+    pthread_mutex_t* switchFazeMutex{};
     std::vector<pthread_t*> threadsVec;
     std::vector<ThreadContext *> threadContexts;
 }JobContext;
@@ -84,7 +85,7 @@ JobContext * initJob(const InputVec &inputVec,
                      std::atomic<long unsigned int>* pairsProcessed,
                      std::atomic<long unsigned int>* totalMappedPairs,
                      std::atomic<bool>* isWaitFor,
-                     pthread_mutex_t* waitForMutex);
+                     pthread_mutex_t* waitForMutex, pthread_mutex_t* switchFazeMutex);
 
 /**
  * Fnction to initialize a thread context
@@ -154,7 +155,7 @@ void emit3(K3 *key, V3 *value, void *context)
 }
 
 JobHandle startMapReduceJob(const MapReduceClient &client, const InputVec &inputVec,
-                            OutputVec &outputVec, int multiThreadLevel)
+                  OutputVec &outputVec, int multiThreadLevel)
 {
 
     auto * barrier = new(std::nothrow) Barrier(multiThreadLevel);
@@ -164,13 +165,16 @@ JobHandle startMapReduceJob(const MapReduceClient &client, const InputVec &input
     auto * shuffleSem = new(std::nothrow) sem_t;
     auto * shuffledPointer = new (std::nothrow) bool;
     auto * pushBackMutex = new (std::nothrow) pthread_mutex_t;
+    auto * switchFazeMutex = new (std::nothrow) pthread_mutex_t;
     auto * waitForMutex = new (std::nothrow) pthread_mutex_t;
     auto *pairsProcessed = new(std::nothrow) std::atomic<long unsigned int>;
     int sem = sem_init(shuffleSem, 0, 1); // return 0 on success, -1 otherwise
     int ptrd_init = pthread_mutex_init(pushBackMutex, nullptr);
     int ptrd_init2 = pthread_mutex_init(waitForMutex, nullptr);
+    int ptrd_init3 = pthread_mutex_init(switchFazeMutex, nullptr);
     if (!barrier || !idxCounter || !totalMappedPairs || !shuffleSem || sem
-        || !shuffledPointer || !pushBackMutex || ptrd_init || !pairsProcessed || !waitForMutex || !isWaitFor || ptrd_init2)
+        || !shuffledPointer || !pushBackMutex || ptrd_init || !pairsProcessed || !waitForMutex ||
+        !isWaitFor|| !switchFazeMutex || ptrd_init2 || ptrd_init3)
     {
         printErr("Failed to allocate memory for the job.");
     }
@@ -180,7 +184,7 @@ JobHandle startMapReduceJob(const MapReduceClient &client, const InputVec &input
     *shuffledPointer = false;
     *isWaitFor = false;
 
-    JobContext *job = initJob(inputVec, &outputVec, pairsProcessed, totalMappedPairs, isWaitFor, waitForMutex);
+    JobContext *job = initJob(inputVec, &outputVec, pairsProcessed, totalMappedPairs, isWaitFor, waitForMutex, switchFazeMutex);
 
     job->stage = MAP_STAGE;
     for (int i = 0; i < multiThreadLevel; ++i)
@@ -200,7 +204,17 @@ void waitForJob(JobHandle job)
     {
         printErr("Failed to lock mutex.");
     }
-    if (*jobContext->isWaitedFor) return;
+
+    if (*jobContext->isWaitedFor)
+    {
+        err = pthread_mutex_unlock(jobContext->waitForMutex);
+        if (err)
+        {
+            printErr("Failed to unlock mutex.");
+        }
+        return;
+    }
+
     for (auto thread: jobContext->threadsVec)
     {
         pthread_join(*thread, nullptr);
@@ -215,20 +229,25 @@ void waitForJob(JobHandle job)
 
 void getJobState(JobHandle job, JobState *state)
 {
+
     auto * jobContext = static_cast<JobContext *>(job);
+    int err = pthread_mutex_lock(jobContext->switchFazeMutex);
+    if (err) printErr("Failed to lock mutex");
     state->stage = jobContext->stage;
-    auto moneh = (float) *(jobContext->pairsProcessed);
+    auto moneh = (float) *(jobContext->pairsProcessed), mehane1 = (float)jobContext->inputVec.size(),
+    mehane2 = (float)*jobContext->totalMappedPairs, mehane3 = (float)jobContext->victor.size();
+
     float mehane;
     switch (state->stage)
     {
         case MAP_STAGE:
-            mehane = (float)jobContext->inputVec.size();
+            mehane = mehane1;
             break;
         case SHUFFLE_STAGE:
-            mehane = (float)*jobContext->totalMappedPairs;
+            mehane = mehane2;
             break;
         case REDUCE_STAGE:
-            mehane = (float)jobContext->victor.size();
+            mehane = mehane3;
             break;
         default:
             // UNDEFINED
@@ -237,6 +256,8 @@ void getJobState(JobHandle job, JobState *state)
     }
     float temp = (moneh / mehane) * 100 ;
     state->percentage = temp < 100 ? temp : 100;
+    err = pthread_mutex_unlock(jobContext->switchFazeMutex);
+    if (err) printErr("Failed to lock mutex");
 }
 
 void closeJobHandle(JobHandle job)
@@ -245,6 +266,7 @@ void closeJobHandle(JobHandle job)
     waitForJob(jobContext);
     delete jobContext->isWaitedFor;
     delete jobContext->waitForMutex;
+    delete jobContext->switchFazeMutex;
     auto firstContext = jobContext->threadContexts.at(0);
     freeContextResources(firstContext);
     for (ThreadContext* context: jobContext->threadContexts)
@@ -285,15 +307,27 @@ void *mapReduce(void* arg)
     // if shuffle phase isn't over yet - shuffle.
     if (!(*trdContext->isShuffled)) // isShuffled is initialized to false.
     {
-        // do shuffle
+        //switch faze to shuffle
+        int err = pthread_mutex_lock(trdContext->job->switchFazeMutex);
+        if (err) printErr("Failed to lock mutex");
         trdContext->job->stage = SHUFFLE_STAGE;
         *trdContext->pairsProcessed = 0;
         *trdContext->idxCounter = 0;
+        err = pthread_mutex_unlock(trdContext->job->switchFazeMutex);
+        if (err) printErr("Failed to lock mutex");
+
+        // do shuffle
         shuffle(trdContext->job->victor, trdContext->job->threadContexts);
         *trdContext->isShuffled = true;
+
+        // switch faze to reduce.
+        err = pthread_mutex_lock(trdContext->job->switchFazeMutex);
+        if (err) printErr("Failed to lock mutex");
         trdContext->job->stage = REDUCE_STAGE;
         *trdContext->pairsProcessed = 0;
         *trdContext->idxCounter = 0;
+        err = pthread_mutex_unlock(trdContext->job->switchFazeMutex);
+        if (err) printErr("Failed to lock mutex");
     }
     sem_post(trdContext->shuffleSemaphore);
 
@@ -318,7 +352,7 @@ void printErr(const std::string& str)
 JobContext * initJob(const InputVec &inputVec, OutputVec *outputVec,
                      std::atomic<long unsigned int>* pairsProcessed,
                      std::atomic<long unsigned int>* totalMappedPairs,
-                     std::atomic<bool>* isWaitFor, pthread_mutex_t* waitForMutex)
+                     std::atomic<bool>* isWaitFor, pthread_mutex_t* waitForMutex, pthread_mutex_t* switchFazeMutex)
 {
     auto *job = new(std::nothrow) JobContext();
     if (!job)
@@ -332,6 +366,7 @@ JobContext * initJob(const InputVec &inputVec, OutputVec *outputVec,
     job->totalMappedPairs = totalMappedPairs;
     job->isWaitedFor = isWaitFor;
     job->waitForMutex = waitForMutex;
+    job->switchFazeMutex = switchFazeMutex;
     return job;
 }
 
@@ -397,8 +432,8 @@ IntermediateVec extractMax(IntermediatePair pair, std::vector<ThreadContext *>& 
     {
         // check if the intermediate vector contains the pairs' key
         while (!(thread->intermediateVec.empty()) &&
-               !(compareIntermediatePairs(pair,thread->intermediateVec.back()) ||
-                 compareIntermediatePairs(thread->intermediateVec.back(), pair)))
+        !(compareIntermediatePairs(pair,thread->intermediateVec.back()) ||
+                compareIntermediatePairs(thread->intermediateVec.back(), pair)))
         {
             toReturn.push_back(thread->intermediateVec.back());
             (*thread->idxCounter)++;
